@@ -1,0 +1,1240 @@
+---
+title: "Review of Data Driven Binning Strategy for Insurance Tariff Classes"
+format:
+  html:
+    number-sections: false
+editor: visual
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Overview
+
+*A data driven strategy to bin continuous and spatial risk factors in order to obtain categorical risk factors with a limited number of levels.c*
+
+"Generalized additive models (GAMs) extend the framework of GLMs and allow for smooth continuous effects in the predictor structure. This results in a statistically more flexible model compared to the GLM. In practice however, actuaries tend to prefer the simplicity of GLMs with categorical risk factors over GAMs with smooth effects, because pricing models should be interpretable, intuitive, explainable to clients and regulators, easy to program and adjustable to marketing needs and benchmark studies with competitors."
+
+Authors frame this paper between two existing approaches (? according to who) of handling different types of risk factors (features) (categorical, continuous, spatial) in insurance pricing literature:
+
+1.  Predefined bins for the continuous and spatial features. A disadvantage of which is that the response variable isn't taken into account in the binning process.
+2.  Develop GAMs for pricing with flexible effects of continuous and spatial risk factors. Presumably these don't align well with the production requirements of an insurance company?
+
+<https://katrienantonio.github.io/publication/>
+
+<https://katrienantonio.github.io/publication/2018-data-driven/>
+
+<https://katrienantonio.github.io/publication/2021-boosting/>
+
+## tl;dr
+
+-   *"... a general framework that aligns the statistical advantages of flexible modeling with GAMs to the requirements of a production environment in an insurance company."*
+
+-   Illustrates a basic strategy to construct tariff classes in GLMs in a data driven way.
+
+-   Bin *continuous* and *spatial* risk factors based on their GAM effects, resulting in categorical risk factors which are easily deployed in a GLM.
+
+-   Start from GAMs with smooth effects and transform these models into GLMs with categorical effects that satisfy the practical needs of the company to present and explain to internal and external stakeholders.
+
+-   Perform an exhaustive search for the optimal GAM model without taking account interactions between the risk factors.
+
+-   In the next step perform an additional exhaustive search for meaningful interactions which improve the model fit, only exploring interactions between continuous risk factors which have been selected in the first step.
+
+EXPAND THIS BY USING PURE PREMIUM
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+library(magrittr)
+library(dplyr)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(sf)
+library(tmap)
+library(mgcv)
+library(gratia)
+library(classInt)
+
+# colors for the paper
+KULbg <- "#116E8A"
+```
+
+```{r data-import, echo=FALSE}
+
+mtpl_orig <- read.table('./scripts/data/P&Cdata.txt', header = TRUE)
+mtpl_orig <- dplyr::as_tibble(mtpl_orig)
+
+mtpl <- mtpl_orig %>%
+    dplyr::rename_all(function(.name) {
+        .name %>% tolower}
+        )
+mtpl <- dplyr::rename(mtpl, expo = exp)
+```
+
+# The Data
+
+Belgian motor data. *At policyholder level*. Typical motor claim & loss distribution.
+
+| **Variable** | **Description**                                                                                                                  |
+|-------------|----------------------------------------------------------|
+| nclaims      | The number of claims filed by the policyholder.                                                                                  |
+| exp          | The fraction of the year 1997 during which the policyholder was exposed to the risk.                                             |
+| amount       | The total amount claimed by the policyholder in Euros.                                                                           |
+| coverage     | Type of coverage provided by the insurance policy: TPL, PO or FO.                                                                |
+|              | TPL = only third party liability, BI/PD                                                                                          |
+|              | PO = partial omnium = TPL + limited material damage, BI/PD + Coll                                                                |
+|              | FO = full omnium = TPL + comprehensive material damage. BI/PD + Coll + Comp                                                      |
+| fuel         | Type of fuel of the vehicle: gasoline or diesel.                                                                                 |
+| sex          | Gender of the policyholder: male or female.                                                                                      |
+| use          | Main use of the vehicle: private or work.                                                                                        |
+| fleet        | The vehicle is part of a fleet: yes or no.                                                                                       |
+| ageph        | Age of the policyholder in years.                                                                                                |
+| power        | Horsepower of the vehicle in kilowatt.                                                                                           |
+| agec         | Age of the vehicle in years.                                                                                                     |
+| bm           | Level occupied in the former compulsory Belgian bonus–malus scale. From 0 to 22, a higher level indicates a worse claim history. |
+| long         | Longitude coordinate of the center of the municipality where the policyholder resides.                                           |
+| lat          | Latitude coordinate of the center of the municipality where the policyholder resides.                                            |
+
+## Data Example
+
+```{r}
+
+#| label: tbl-belgmotor
+#| tbl-cap: "Belgian Motor Data"
+ 
+mtpl %>%
+    dplyr::slice(1:5) %>%
+    dplyr::select(-id, -long, -lat) %>%
+    gt::gt() %>%
+        gt::tab_header(
+            title = gt::md("**Belgian Motor Data**")
+        ) %>%
+        gt::fmt_number(
+            columns = c(amount, avg, expo), 
+            decimals = 2,
+        )
+```
+
+```{r plot_wrappers}
+
+col <- KULbg
+fill <- KULbg
+ylab <- "Relative frequency"
+
+# wrapper functions
+ggplot.bar <- function(DT, variable, xlab){
+  ggplot(data = DT, aes(as.factor(variable))) + theme_bw() + 
+    geom_bar(aes(y = (after_stat(count))/sum(after_stat(count))), col = col, fill = fill, alpha = 0.5) + labs(x = xlab, y = ylab)
+}
+
+ggplot.hist <- function(DT, variable, xlab, binwidth){
+  ggplot(data = DT, aes(variable)) + theme_bw() + 
+    geom_histogram(aes(y = (after_stat(count))/sum(after_stat(count))), binwidth = binwidth, col = col, fill = fill, alpha = 0.5) + 
+    labs(x = xlab, y = ylab)
+}
+```
+
+## Exploratory Data Analysis
+
+```{r}
+# capping severity for whatever reason
+mtpl.sev <- mtpl %>% 
+    dplyr::filter(amount > 0 & avg <= 81000)
+
+plot.eda.nclaims <- ggplot.bar(mtpl, variable = mtpl$nclaims, "Number of Claims")
+plot.eda.exp <- ggplot.hist(mtpl, mtpl$expo, "Exposure", 0.05)
+plot.eda.amount <- ggplot(data = mtpl.sev, aes(avg)) + geom_density(adjust = 3, col = col, fill = fill, alpha = 0.5) + xlim(0, 1e4) + ylab(ylab) + xlab("Severity") + theme_bw()
+```
+
+```{r}
+#| label: fig-freqsev
+#| fig-cap: "Frequency, Exposure and Severity"
+#| fig-height: 3
+#| fig-width: 8
+
+grid.arrange(plot.eda.nclaims, plot.eda.exp, plot.eda.amount, ncol=3)
+```
+
+```{r}
+
+# Bar plots of factor variables
+plot.eda.coverage <- ggplot.bar(mtpl, mtpl$coverage, "coverage")
+plot.eda.fuel <- ggplot.bar(mtpl, mtpl$fuel, "fuel")
+plot.eda.sex <- ggplot.bar(mtpl, mtpl$sex, "sex")
+plot.eda.use <- ggplot.bar(mtpl, mtpl$use, "use")
+plot.eda.fleet <- ggplot.bar(mtpl, mtpl$fleet, "fleet")
+
+# Histograms of continuous variables
+plot.eda.ageph <- ggplot.hist(mtpl, mtpl$ageph, "policyholder age", 2)
+plot.eda.agec <- ggplot.hist(mtpl, mtpl$agec, "vehicle age", 1)
+plot.eda.bm <- ggplot.hist(mtpl, mtpl$bm, "bonus-malus", 2)
+plot.eda.power <- ggplot.hist(mtpl, mtpl$power, "vehicle power", 10)
+```
+
+```{r}
+#| label: fig-covariates
+#| fig-cap: "Model Features"
+#| fig-height: 9
+#| fig-width: 8
+
+grid.arrange(
+    plot.eda.coverage,
+    plot.eda.fuel,
+    plot.eda.sex,
+    plot.eda.use,
+    plot.eda.fleet,
+    plot.eda.ageph,
+    plot.eda.power,
+    plot.eda.agec,
+    plot.eda.bm, ncol = 3)
+```
+
+Further looking at spatial data and data interactions. 1,146 total postocodes in Belgium. Missing values and low exposure values in the south of the country.
+
+```{r}
+
+#| label: fig-spatial
+#| fig-cap: "Spatial Distribution of Claims Frequency"
+#| fig-height: 6
+#| fig-width: 8
+
+belgium_shape_sf <- st_read('./scripts/shape file Belgie postcodes/npc96_region_Project1.shp', quiet = TRUE)
+simple_shp <- st_simplify(belgium_shape_sf, dTolerance = 10)
+belgium_shape_sf <- st_transform(simple_shp, crs = st_crs("+proj=longlat +datum=WGS84"))
+
+post_expo <- mtpl %>% 
+    group_by(pc) %>% 
+    summarise(num=n(), total_expo=sum(expo))
+
+belgium_shape_sf <- left_join(
+    belgium_shape_sf,
+    post_expo,
+    by = c("POSTCODE" = "pc")
+
+)
+
+belgium_shape_sf$freq <- belgium_shape_sf$total_expo/belgium_shape_sf$Shape_Area
+belgium_shape_sf$freq_class <- cut(belgium_shape_sf$freq, breaks = quantile(belgium_shape_sf$freq, c(0,0.2,0.8,1), na.rm = TRUE), right = FALSE, include.lowest = TRUE, labels = c("low", "average", "high"))
+
+ggplot(belgium_shape_sf) +
+    geom_sf(aes(fill = freq_class), colour = "black", size = 0.1) +
+    ggtitle("MTPL claim frequency data") +
+    labs(fill = "Relative\nexposure") +
+    scale_fill_brewer(palette = "Blues", na.value = "white") +
+    theme_bw()
+```
+
+Apparently there might be some interaction between vehicle power and driver age in the data as indicated in the models below. So the authors plot that here.
+
+```{r}
+
+#| label: fig-agepower
+#| fig-cap: "Age and Power Interaction"
+#| fig-height: 6
+#| fig-width: 8
+
+
+ggplot(mtpl, aes(x=ageph, y=power)) +
+    stat_density2d(aes(fill=..level..), geom="polygon") +
+    scale_fill_gradient("Density", high="#003366", low="#99CCFF") +
+    theme_bw() +
+    xlab("Policyholder Age") +
+    ylab("Vehicle Power") +
+    xlim(20, 80) +
+    ylim(30, 90)
+
+```
+
+# Generalized Additive Models for P&C Pricing
+
+The general expression for Generalized Additive Models (GAM) for use in actuarial regression. Theory not discussed here.
+
+$$
+\eta_i=g\left(\mu_i\right)=\beta_0+\sum_{j=1}^p \beta_j x_{i j}^d+\sum_{j=1}^q f_j\left(x_{i j}^c\right)+\sum_{j=1}^r f_j\left(x_{i j}^s, y_{i j}^s\right)
+$$
+
+1.  Perform an exhaustive search for the optimal GAM without taking into account interactions between the risk factors.
+
+2.  Perform an additional search for meaningful interactions which improve model fit.
+
+## Frequency Model Search
+
+MAKE SURE smoothing parameters are estimated correctly per the paper.
+
+1.  Determine the BIC of all possible model combinations.
+
+$$
+\begin{aligned}
+\log (\mathbb{E}(\text { nclaims }))= & \log (\text { exp })+\beta_0+\beta_1 \text { coverage }_{P O}+\beta_2 \text { coverage }_{F O}+\beta_3 \text { fuel }_{\text {diesel }} \\
+& \left.+\beta_4 \text { sex }_{\text {female }}+\beta_5 \text { use }_{\text {work }}+\beta_6  \text { fleet }_Y+f_1(\text { ageph })+f_2 \text { (power }\right) \\
+& +f_3(\text { agec })+f_4(\mathrm{bm})+f_5(\text { long, lat })
+\end{aligned}
+$$
+
+See Ohlsson for an alternative approach to model the spatial effect as a multi-level factor in a *credibility framework*.
+
+That's 1,024 models to evaluate. Can take a considerable time chunk to run. Code below. How can we parallelize this?
+
+```{r freq_mod_search01}
+
+#| eval: false
+
+response <- "nclaims"
+predictors <- c("coverage", "fuel", "sex", "use", "fleet", "s(ageph, bs='tp')", "s(power, bs='tp')", "s(agec, bs='tp')", "s(bm, bs='tp')", "s(long, lat, bs='tp')")
+
+# Generate all possible combinations of predictors
+
+model_combinations <- unlist(
+    lapply(1:length(predictors), function(x) combn(predictors, x, simplify = FALSE)),
+    recursive = FALSE
+)
+
+low_bic <- Inf
+low_formula <- NULL
+
+# Start the timer
+start_time <- Sys.time()
+
+for (comb in model_combinations) {
+    
+    formula <- as.formula(
+        paste(response, "~", paste(comb, collapse = " + "))
+    )
+    mdl <- mgcv::gam(formula = formula,
+                     offset = log(expo),
+                     data = mtpl,
+                     family = poisson(link = "log"),
+                     method = "GCV.Cp")
+    bic <- BIC(mdl)
+    if (bic < low_bic) {
+        low_bic <- bic
+        low_formula <- formula
+    }
+
+}
+
+# End the timer
+end_time <- Sys.time()
+
+# Calculate the elapsed time
+elapsed_time <- end_time - start_time
+
+cat("Best Model Formula:\n")
+print(low_formula)
+cat("\nLowest BIC:", low_bic, "\n")
+cat("Time taken:", elapsed_time, "\n")
+
+```
+
+Model with the lowest BIC:
+
+$$
+\begin{aligned}
+& \log (\mathbb{E}(\text { nclaims }))=\log (\exp )+\beta_0+\beta_1 \text { coverage }_{P O}+\beta_2 \text { coverage }_{F O}+\beta_3 \text { fuel }_{\text {diesel }} \\
+& \left.\left.+f_1 \text { (ageph }\right)+f_2 \text { (power }\right)+f_3(\mathrm{bm})+f_4(\text { long, lat) }
+\end{aligned}
+$$
+
+2.  Perform an additional search for meaningful interactions which improve model fit. Add interaction effects between the continuous risk factors.
+
+Assuming this is limited to main continuous effects included in the model above. Do they switch to AIC here? They mention that this interaction improves BIC but we can't recreate that?
+
+```{r freq_mod_search02a}
+
+#| eval: true
+
+formula_mod01 <- as.formula(
+    "nclaims ~ coverage + fuel + s(ageph) + s(power) + s(bm) + s(long, lat)")
+
+
+freq_model01 <- mgcv::gam(formula = formula_mod01,
+                     offset = log(expo),
+                     data = mtpl,
+                     family = poisson(link = "log"),
+                     method = "GCV.Cp")
+
+freq_gam <- mgcv::gam(nclaims  ~  coverage + fuel + 
+                          s(ageph) + s(bm) + s(power) + s(long, lat) + ti(ageph, power, bs = "tp"), 
+                      offset = log(expo), 
+                      data = mtpl, 
+                      family = poisson(link = "log"),
+                      method = "GCV.Cp")
+
+continuous_predictors <- c("ageph", "power", "bm")
+
+continuous_combinations <- unlist(
+    lapply(2:2, function(x) combn(continuous_predictors, x, simplify = FALSE)),
+    recursive = FALSE
+)
+```
+
+```{r freq_mod_search02b}
+
+#| eval: false
+
+# change to BIC and figure out why we can't get the same values as authors?
+
+low_aic <- AIC(freq_model01)
+low_formula <- formula_mod01
+
+# Start the timer
+start_time <- Sys.time()
+
+for (comb in continuous_combinations) {
+    
+    new_term <- paste0("ti(", comb[1], ", ", comb[2], ", bs=\"tp\")")
+    new_formula <- update.formula(freq_model01$formula, paste(". ~ . +", new_term))
+    
+
+    mdl <- mgcv::gam(new_formula,
+                     offset = log(expo),
+                     data = mtpl,
+                     family = poisson(link = "log"),
+                     method = "GCV.Cp")
+    
+    aic <- AIC(mdl)
+    
+    if (aic < low_aic) {
+        low_aic <- aic
+        low_formula <- new_formula
+    }
+}
+
+# End the timer
+end_time <- Sys.time()
+
+# Calculate the elapsed time
+elapsed_time <- end_time - start_time
+
+# This should be BIC.  Why can't we get the same result as the paper?
+cat("Best Model Formula:\n")
+print(low_formula)
+cat("\nLowest AIC:", low_aic, "\n")
+cat("Time taken:", elapsed_time, "\n")
+```
+
+This gives us the Frequency GAM specified in the paper.
+
+$$
+\begin{aligned}
+& \log (\mathbb{E}(\text { nclaims }))=\log (\exp )+\beta_0+\beta_1 \text { coverage }_{P O}+\beta_2 \text { coverage }_{F O}+\beta_3 \text { fuel }_{\text {diesel }} \\
+& +f_1 \text { (ageph) }+f_2 \text { (power) }+f_3(\mathrm{bm})+f_4 \text { (ageph, power) }+f_5 \text { (long, lat) }
+\end{aligned}
+$$
+
+#### Main Effects
+
+```{r gratia_plot_wrappers}
+
+gratia_plot_single <- function(model, smoother, DTvar){
+    column <- ensym(DTvar)
+    sm <- gratia::smooth_estimates(model, select = smoother)
+    plot <- sm %>% gratia::add_confint() %>%
+        ggplot(aes(y = .estimate, x = !!column)) +
+            theme_bw() +
+            geom_ribbon(aes(ymin = .lower_ci, ymax = .upper_ci),
+                alpha = 0.2, fill = "#99CCFF"
+            ) +
+            geom_line(colour = "#003366", linewidth = 1.5) +
+            labs(
+                y = "Partial Effect",
+                x = column
+            )
+    return(plot)
+}
+
+```
+
+```{r freq_main_effects}
+
+#| label: fig-freqmaineffects
+#| fig-cap: "Frequency Main Continuous Effects"
+#| fig-height: 3
+#| fig-width: 8
+
+gratia_plot_ageph <- gratia_plot_single(freq_gam, "s(ageph)", ageph)
+gratia_plot_power <- gratia_plot_single(freq_gam, "s(power)", power)
+gratia_plot_bm <- gratia_plot_single(freq_gam, "s(bm)", bm)
+
+grid.arrange(gratia_plot_ageph, gratia_plot_power, gratia_plot_bm, ncol=3, top = textGrob("Continous Feature Partial Effects"))
+
+# gratia::draw(freq_gam, select = c("s(ageph)","s(power)","s(bm)"), ncol = 3) & theme_bw()
+
+```
+
+#### Interaction Effects
+
+-   Low `ageph` Low `power` and High `ageph` High `power` are less risky than the two main effects predict.
+
+-   Low `ageph` High `power` and High `ageph` Low `power` are more risky that the two main effects predict.
+
+```{r freq_interaction_effects}
+
+#| label: fig-freqinteraction
+#| fig-cap: "Frequency Interaction Continuous Effects"
+#| fig-height: 3
+#| fig-width: 8
+
+
+sm <- gratia::smooth_estimates(freq_gam)
+
+ggplot() +
+    geom_contour_filled(
+        data=sm,
+        aes(x=ageph, y=power, z=.estimate),
+        bins = 30,
+        col = "white"
+    ) +
+    scale_fill_brewer(palette = "Blues") +
+    theme_bw()
+
+#ggplot(data=sm) +
+#    geom_raster(
+#        aes(x=ageph, y=power, fill=.estimate)) +
+#    scale_fill_gradient(low="#99CCFF",high="#003366") +
+#    theme_bw() +
+#    stat_contour(aes(x=ageph, y=power, z=.estimate),breaks=0,lty=1,colour="white") +
+#    stat_contour(aes(x=ageph, y=power, z=.estimate),lty=2,colour="white", bins=50)
+```
+
+#### Spatial Effects
+
+```{r freq_spatial_effect}
+
+#| label: fig-freqspatialeffect
+#| fig-cap: "Frequency Spatial Effect"
+#| fig-height: 3
+#| fig-width: 8
+
+# create a copy of this shape file to work with
+freq_spatial_sf <- belgium_shape_sf
+
+# create prediction shape file for the fit
+post_dt <- sf::st_centroid(freq_spatial_sf)
+post_dt$long <- do.call(rbind, post_dt$geometry)[,1]
+post_dt$lat <- do.call(rbind, post_dt$geometry)[,2]
+post_dt$coverage <- mtpl$coverage[1]
+post_dt$fuel <- mtpl$fuel[1]
+post_dt[c("bm", "ageph", "power", "expo")] <- 
+  c(mtpl$bm[1], mtpl$ageph[1], mtpl$power[1], mtpl$expo[1])
+
+#predict
+pred <- predict(freq_gam, newdata = post_dt, 
+                type = "terms", terms = "s(long,lat)")
+
+dt_pred <- tibble(pc = post_dt$POSTCODE, 
+                      long = post_dt$long, 
+                      lat = post_dt$lat, pred)
+names(dt_pred)[4] <- "fit_spatial"
+dt_pred <- dplyr::arrange(dt_pred, pc)
+
+num_bins <- 5
+# Bin with Fisher-Jenks (~K means)
+classint_fisher <- classInt::classIntervals(
+                      dt_pred$fit_spatial, 
+                      num_bins, 
+                      style = "fisher")
+
+freq_spatial_sf <- left_join(freq_spatial_sf, dt_pred, by = c("POSTCODE" = "pc"))
+
+ggplot(freq_spatial_sf) +
+  geom_sf(aes(fill = fit_spatial), colour = NA) +
+  ggtitle("MTPL claim frequency data") +
+  scale_fill_gradient(low = "#99CCFF", 
+                      high = "#003366") +
+  theme_bw()
+```
+
+## Severity Model Search
+
+1.  Determine the BIC of all possible model combinations.
+2.  Perform an additional search for meaningful interactions which improve model fit. Add interaction effects between the continuous risk factors.
+
+$$
+\mathbb{E}(\log (\text { avg }))=\gamma_0+\gamma_1 \text { coverage }_{P O}+\gamma_2 \text { coverage }_{F O}+g_1(\text { ageph })+g_2(\mathrm{bm})
+$$
+
+## Pure Premium Model Search
+
+We consider the following initial model:
+
+$$
+\begin{aligned}
+\log (\mathbb{E}(\text { nclaims }))= & \log (\text { exp })+\beta_0+\beta_1 \text { coverage }_{P O}+\beta_2 \text { coverage }_{F O}+\beta_3 \text { fuel }_{\text {diesel }} \\
+& \left.+\beta_4 \text { sex }_{\text {female }}+\beta_5 \text { use }_{\text {work }}+\beta_6  \text { fleet }_Y+f_1(\text { ageph })+f_2 \text { (power }\right) \\
+& +f_3(\text { agec })+f_4(\mathrm{bm})+f_5(\text { long, lat })
+\end{aligned}
+$$
+
+```{r}
+
+library(tweedie)
+```
+
+```{r}
+
+mtpl_pprem <- mtpl %>%
+    dplyr::mutate(pprem = amount/expo)
+```
+
+```{r}
+
+formula_pprem <- as.formula(
+    "pprem ~ coverage + fuel + sex + use + fleet + s(ageph) + s(power) + s(bm) + s(long, lat)")
+
+
+pprem_model01 <- mgcv::gam(formula = formula_pprem,
+                           offset = log(expo),
+                           data = mtpl_pprem,
+                           family = Tweedie(p = 1.5, link = "log"),
+                           method = "GCV.Cp")
+```
+
+```{r}
+
+summary(pprem_model01)
+```
+
+# Data Driven Binning Strategies
+
+For practical purposes, *insurers prefer* (not sure how strong this assumption is) a pricing model where each risk factor is categorical. This *makes the price list easy to implement, explain and adjust.*
+
+## Binning Spatial Effects
+
+<https://r.geocompx.org/> - Reference of Geo-computation with R
+
+[https://r-spatial.org/](https://r-spatial.org/book/) - Excellent Reference!
+
+There are 1,146 Belgian municipalities. There is a single number which represents the **spatial riskiness** of each municipality:
+
+$$
+s_i=\hat{f_5}\left(\text { long }_i, \operatorname{lat}_i\right) \text { for } i \in\{1, \ldots, 1146\}
+$$
+
+The goal should be, the optimal grouping of municipalities with similar spatial riskiness together.
+
+This authors finds the **Fisher-Jenks** algorithm "best" but discuss others. This is approximately K means clustering.
+
+| Procedure | Find Optimal Number of Bins Spatial Effect                                                                                                                                                                                  |
+|------------|------------------------------------------------------------|
+| Step 1    | Apply Fisher's natural breaks algorithm from `classInt` package to calculate the bin intervals for the spatial effect. Bin intervals are used to transform the continuous spatial effect into a categorical spatial effect. |
+| Step 2    | Estimate a new GAM that categorizes the spatial effect. This GAM contains the spatial effect in a categorical format, but still uses flexible effects to model the continuous risk factors.                                 |
+| Step 3    | Calculate AIC/BIC of the GAM with binned spatial effect. Use this to select the best *k* according to predetermined criteria.                                                                                               |
+
+: Find Optimal Bins Spatial Effect
+
+An example of optimum binning for Frequency. *K* = 5.
+
+```{r plot_freq_spatial_bin}
+
+#| label: fig-freqspatialbin
+#| fig-cap: "Spatial Effect Binning Optimal Clusters"
+#| fig-height: 3
+#| fig-width: 8
+
+freq_spatial_sf$class_fisher <- cut(freq_spatial_sf$fit_spatial, 
+      breaks = classint_fisher$brks, 
+      right = FALSE, include.lowest = TRUE, 
+      dig.lab = 2)
+
+ggplot(freq_spatial_sf) + theme_bw() + 
+  labs(fill = "Fisher") +
+  geom_sf(aes(fill = class_fisher), colour = NA) +
+  ggtitle("MTPL Claim Frequency Data - Binned") +
+  scale_fill_brewer(palette = "Blues", 
+                    na.value = "white") +
+  theme_bw()
+```
+
+This leads to a model of the form - moving the spatial effect into a categorical effect, with bin 4 as the base level.
+
+$$
+\begin{aligned}
+\log (\mathbb{E}(\text { nclaims }))= & \log (\text { exp })+\beta_0+\beta_1 \text { coverage }_{P O}+\beta_2 \text { coverage }_{F O}+\beta_3 \text { fue } 1_{\text {diesel }} \\
+& +\beta_4 \text { geo }_{1}+\beta_5 \text { geo }_{2}+\beta_6 \text { geo }_{3} +\beta_7 \text { geo }_{5} \\
+& \left.\left.+f_1 \text { (ageph }\right)+f_2(\text { power })+f_3(\mathrm{bm})+f_4 \text { (ageph, power }\right)
+\end{aligned}
+$$
+
+```{r freq_model_binned_geo}
+
+#| echo: True
+
+# reformat the dataset
+mtpl_geo <- mtpl %>% dplyr::select(nclaims, expo, coverage, fuel, ageph, bm, power, pc)
+# add spatial predict
+mtpl_geo <- dplyr::left_join(mtpl_geo, dt_pred, by='pc')
+# add spatial binned feature
+mtpl_geo$geo <- as.factor(
+    cut(mtpl_geo$fit_spatial, breaks = classint_fisher$brks, right = FALSE,
+        include.lowest = TRUE, dig.lab = 2)
+)
+
+# factor variable geo replacing the spatial smoother s(long, lat)
+
+freq_gam_geo <- mgcv::gam(nclaims ~ coverage + fuel + s(ageph) + s(bm) + s(power) +
+                              ti(ageph, power, bs = "tp") + geo,
+                          offset = log(expo),
+                          data = mtpl_geo,
+                          family = poisson(link = "log")
+                          )
+
+```
+
+## Binned Continuous Risk Factors
+
+Paper proposes the use of regression trees as a technique to perform the binning since these models produce *intuitive splits* (what does that mean?) in line with our requirement of grouping consecutive values of the continuous variables.
+
+Grow a regression tree for each of the fitted flexible effects, with the flexible effect - $\hat{f_{1}}(\text{ageph})$ - and the corresponding risk factor as covariate - `ageph`. $\hat{f_{1}}(\text{ageph}) \sim \text{ageph}$ , for example.
+
+The distribution of the policyholders with respect to a specific risk factor is taken into account using the number of policyholders as weights. Impose a constraint to make sure bins are not too sparsely populated by requiring each bin contain at least 5% of the policyholders in the entire portfolio.
+
+See paper for further details but we want the tree to balance goodness-of-fit and complexity by tuning $\alpha$.
+
+$$
+n \cdot \text{MSE} + \alpha \cdot \text{complexity}
+$$
+
+| Procedure | Find Optimal Tuning Parameter $\alpha$ For Trees                                                                                                                                                                                                 |
+|------------|------------------------------------------------------------|
+| Step 1    | Fit `evtree` to the main and interaction effects of the continuous risk factors. $\alpha$ is chosen from a fixed set of predefined values. Splits produced by these trees are used to transform the continuous effects into categorical effects. |
+| Step 2    | Estimate a GLM with the resulting categorical risk factors.                                                                                                                                                                                      |
+| Step 3    | Calculate AIC of the GLM                                                                                                                                                                                                                         |
+
+: Optimal $\alpha$ tuning parameter for `evtree` for main and interaction effects
+
+Authors chose the unequally spaced set of alpha to search over:
+
+$\{1,1.5,2, \ldots, 9.5,10,15,20, \ldots, 95,100,150,200, \ldots, 950\}$
+
+```{r alpha_space}
+
+alpha_space <- c(seq(1, 9.5, 0.5), seq(10, 95, 5), seq(100, 950, 50))
+```
+
+```{r getGAMdata_functions}
+
+getGAMdata_single = function(model, term, var, varname){
+    pred <- predict(model, type = 'terms', terms = term)
+    # round this term -- predict() strange here
+    pred <- round(pred, 4)
+    dt_pred <- tibble("x" = var, pred)
+    colnames(dt_pred) = c("x", "s")
+    dt_unique <- distinct(dt_pred)
+    dt_unique <- arrange(dt_unique, x)
+    # distribution of variable
+    dt_exp <- dt_pred %>% dplyr::group_by(x) %>% dplyr::summarise(tot = n())
+    # force ordering
+    dt_exp <- dt_exp[c("x","tot")]
+    GAM_data <- dplyr::left_join(dt_unique, dt_exp, by = 'x')
+    colnames(GAM_data) <- c(varname, "s", "tot")
+    GAM_data <- GAM_data[which(GAM_data$tot != 0), ]
+    return(GAM_data)
+}
+
+getGAMdata_multi = function(model, term, var1, var2, varnames){
+    pred <- predict(model, type = 'terms', terms = term)
+    pred <- round(pred, 4)
+    # dumb way to do this - R is rusty - refactor this shit show
+    dt_pred <- tibble("x" = var1, "y" = var2, pred)
+    colnames(dt_pred) = c("x","y","s")
+    dt_unique <- distinct(dt_pred)
+    dt_unique <- arrange(dt_unique, x, y)
+    # joint distribution of variables
+    dt_exp <- dt_pred %>% dplyr::group_by(x, y) %>% dplyr::summarise(tot = n(), .groups = 'drop_last')
+    # force ordering
+    dt_exp <- dt_exp[c("x","y","tot")]
+    GAM_data <- dplyr::left_join(dt_unique, dt_exp, by = join_by(x, y))
+    colnames(GAM_data) <- c(varnames[1], varnames[2], "s", "tot")
+    GAM_data <- GAM_data[which(GAM_data$tot != 0), ]
+    return(GAM_data)
+}
+
+getGAMdata_int = function(GAMmodel,term,var1,var2,varname1,varname2){
+    pred <- predict(GAMmodel, type = "terms",terms = term)
+    DT_pred <- data.frame("x"=var1,"y"=var2, pred)   
+    DT_pred <- with(DT_pred, DT_pred[order(x,y),])
+    names(DT_pred) = c("x","y","s")
+    DT_unique = unique(DT_pred)
+    DT_exp <- aggregate(s ~ x+y, data=DT_pred, length)
+    DT_exp$exp <- DT_exp$s
+    DT_exp <- DT_exp[c("x","y","exp")]
+    GAM_data = merge(DT_unique,DT_exp,by=c("x","y"))
+    names(GAM_data) = c(varname1,varname2,"s","exp")
+    GAM_data = GAM_data[which(GAM_data$exp!=0),]
+    return(GAM_data)
+}
+
+```
+
+```{r load_evtree}
+
+library(evtree, quietly = TRUE)
+source("~/Projects/PE-pricing-analytics/scripts/evtree.R")
+```
+
+```{r opt_bin_step01a}
+
+#  loop to find optimal alpha would begin around here somewhere...
+
+# Start of Step 1
+
+freq_gam_ageph <- getGAMdata_single(freq_gam_geo, "s(ageph)", mtpl_geo$ageph, "ageph")
+freq_gam_bm <- getGAMdata_single(freq_gam_geo, "s(bm)", mtpl_geo$bm, "bm")
+freq_gam_power <- getGAMdata_single(freq_gam_geo, "s(power)", mtpl_geo$power, "power")
+freq_gam_agephpower <- getGAMdata_int(freq_gam_geo, "ti(ageph,power)", mtpl_geo$ageph, mtpl_geo$power, "ageph", "power")
+
+```
+
+How to tune `evtree` to return optimal results isn't outlined well in this paper. How to set up the optimization of $\alpha$.
+
+```{r opt_bin_step01b}
+
+# Step 1 - Fit evtree to the main and interaction effects of the continuous risk factors
+
+ctrl.freq <- evtree.control(minbucket = 0.05 * nrow(mtpl),
+                            alpha = 500, maxdepth = 5)
+
+evtree_freq_ageph <- evtree(s ~ ageph,
+                            data = freq_gam_ageph,
+                            weights = tot,
+                            control = ctrl.freq)
+
+evtree_freq_bm <- evtree(s ~ bm,
+                            data = freq_gam_bm,
+                            weights = tot,
+                            control = ctrl.freq)
+
+evtree_freq_power <- evtree(s ~ power,
+                            data = freq_gam_power,
+                            weights = tot,
+                            control = ctrl.freq)
+
+evtree_freq_agephpower <- evtree(s ~ ageph + power,
+                                 data = freq_gam_agephpower,
+                                 weights = exp,
+                                 control = ctrl.freq)
+
+```
+
+This gives us the splits we need to transform the continuous effects into categorical variables.
+
+```{r evtree_ageph_plot, fig.width=15}
+
+#| label: fig-freqagephtree
+#| fig-cap: "ageph Continuous Effect EVTree"
+
+plot(evtree_freq_ageph)
+```
+
+```{r evtree_bm_plot, fig.width=15}
+
+#| label: fig-freqagephtree
+#| fig-cap: "bm Continuous Effect EVTree"
+
+plot(evtree_freq_bm)
+```
+
+```{r evtree_power_plot, fig.width=15}
+
+#| label: fig-freqagephtree
+#| fig-cap: "power Continuous Effect EVTree"
+
+plot(evtree_freq_power)
+```
+
+```{r evtree_agephpower_plot, fig.width=15}
+
+#| label: fig-freqagephpowertree
+#| fig-cap: "Interaction Effect EVTree"
+
+plot(evtree_freq_agephpower)
+
+```
+
+```{r get_tree_splits}
+
+# Get the nodes from the trees so we can bin the features
+# Still Step 1
+
+splits_evtree = function(evtreemodel, GAMvar, DTvar){
+    # evtreemodel -> univariate continuous tree model from above
+    preds <- predict(evtreemodel, type = "node")
+    nodes <- data.frame("x" = GAMvar, "nodes" = preds)
+    nodes$change <- c(0, pmin(1, diff(nodes$nodes)))
+    splits_evtree <- unique(c(min(DTvar),
+                              nodes$x[which(nodes$change==1)],
+                              max(DTvar)))
+    return(splits_evtree)
+}
+
+splits2D_evtree = function(evtreemodel,GAMdata, GAMdata_X, GAMdata_Y){
+  pred = predict(evtreemodel,GAMdata,type="response")
+  values <- data.frame("X"=GAMdata_X,"Y"=GAMdata_Y,"pred"=pred)
+  min.X <- as.numeric(tapply(values$X, values$pred, min))
+  min.Y <- as.numeric(tapply(values$Y, values$pred, min))
+  max.X <- as.numeric(tapply(values$X, values$pred, max))
+  max.Y <- as.numeric(tapply(values$Y, values$pred, max))
+  splits_2D_evtree <- data.frame("xmin"=min.X,"xmax"=max.X,"ymin"=min.Y,"ymax"=max.Y)
+  return(splits_2D_evtree)
+}
+
+```
+
+```{r}
+
+# Wrap this up into a 2-way function to generate splits for these
+
+getExtendedAgephPower <- function(){
+    ageph <- seq(min(mtpl_geo$ageph), max(mtpl_geo$ageph))
+    power <- seq(min(mtpl_geo$power), max(mtpl_geo$power))
+    agephpower <- expand.grid(ageph, power)
+    mtpl_geo_ext_agephpower <- data.frame("ageph" = agephpower$Var1, "power" = agephpower$Var2)
+    return(mtpl_geo_ext_agephpower)
+}
+
+mtpl_geo_ext_agephpower <- getExtendedAgephPower()
+mtpl_geo_ext_agephpower$coverage <- mtpl_geo$coverage[1]
+mtpl_geo_ext_agephpower$fuel <- mtpl_geo$fuel[1]
+mtpl_geo_ext_agephpower$bm <- mtpl_geo$bm[1]
+mtpl_geo_ext_agephpower$geo <- mtpl_geo$geo[1]
+mtpl_geo_ext_agephpower$exp <- mtpl_geo$expo[1]
+
+
+pred_int <- predict(freq_gam_geo,
+                    mtpl_geo_ext_agephpower,
+                    type = "terms", terms = "ti(ageph,power)")
+
+#head(mtpl_geo_ext_agephpower)
+GAMext_freq_AGEPHPOWER <- data.frame(mtpl_geo_ext_agephpower$ageph, mtpl_geo_ext_agephpower$power, pred_int)
+names(GAMext_freq_AGEPHPOWER) <- c("ageph","power","s")
+
+splits_freq_AGEPHPOWER <- splits2D_evtree(
+    evtreemodel = evtree_freq_agephpower, 
+    GAMdata = GAMext_freq_AGEPHPOWER, 
+    GAMdata_X = GAMext_freq_AGEPHPOWER$ageph, 
+    GAMdata_Y = GAMext_freq_AGEPHPOWER$power)
+
+```
+
+```{r}
+
+ggplot.gam <- function(model,variable,gam_term,xlabel,ylabel){
+  pred <- predict(model, type = "terms", se = TRUE)
+  col_index <- which(colnames(pred$fit)==gam_term)
+  x <- variable
+  b <- pred$fit[, col_index]
+  l <- pred$fit[, col_index] - qnorm(0.975) * pred$se.fit[, col_index]
+  u <- pred$fit[, col_index] + qnorm(0.975) * pred$se.fit[, col_index]
+  df <- unique(data.frame(x, b, l, u))
+  p <- ggplot(df, aes(x = x))
+  p <- p + geom_line(aes(y = b), size = 1,col="#003366")
+  p <- p + geom_line(aes(y = l), size = 0.5, linetype = 2,col="#99CCFF")
+  p <- p + geom_line(aes(y = u), size = 0.5, linetype = 2,col="#99CCFF")
+  p <- p + xlab(xlabel) + ylab(ylabel) + theme_bw()
+  p
+}
+```
+
+```{r}
+
+splits_freq_AGEPH <- splits_evtree(evtree_freq_ageph, freq_gam_ageph$ageph, mtpl$ageph)
+splits_freq_POWER <- splits_evtree(evtree_freq_power, freq_gam_power$power, mtpl$power)
+splits_freq_BM <- splits_evtree(evtree_freq_bm, freq_gam_bm$bm, mtpl$bm)
+
+```
+
+```{r optimalsinglebins, fig.height=9}
+
+#| label: fig-optimalsinglebins
+#| fig-cap: "Optimal Continous Feature Binning"
+#| fig-height: 9
+#| fig-width: 8
+
+p_ageph <- gratia_plot_single(freq_gam, "s(ageph)", ageph)
+p_ageph <- p_ageph + geom_vline(xintercept = splits_freq_AGEPH[2:(length(splits_freq_AGEPH)-1)])
+callouts <- splits_freq_AGEPH[2:(length(splits_freq_AGEPH)-1)]
+# something here to find middle of y axis to use for y
+for (i in 1:length(callouts)) {
+  p_ageph <- p_ageph + annotate("text", x = callouts[i], y = 0.4, label = callouts[i],
+                    vjust = -0.5, angle = 90, size = 3, color = "blue")
+}
+
+p_power <- gratia_plot_single(freq_gam, "s(power)", power)
+p_power <- p_power + geom_vline(xintercept = splits_freq_POWER[2:(length(splits_freq_POWER)-1)])
+callouts <- splits_freq_POWER[2:(length(splits_freq_POWER)-1)]
+for (i in 1:length(callouts)) {
+  p_power <- p_power + annotate("text", x = callouts[i], y = 0.4, label = callouts[i],
+                    vjust = -0.5, angle = 90, size = 3, color = "blue")
+}
+
+p_bm <- gratia_plot_single(freq_gam, "s(bm)", bm)
+p_bm <- p_bm + geom_vline(xintercept = splits_freq_BM[2:(length(splits_freq_BM)-1)])
+callouts <- splits_freq_BM[2:(length(splits_freq_BM)-1)]
+for (i in 1:length(callouts)) {
+  p_bm <- p_bm + annotate("text", x = callouts[i], y = 0.6, label = callouts[i],
+                    vjust = -0.5, angle = 90, size = 3, color = "blue")
+}
+
+grid.arrange(p_ageph, p_power, p_bm, nrow=3, top = textGrob("Optimal Continous Feature Binning"))
+```
+
+Not sure which of these to use to plot the interaction bins.
+
+```{r}
+
+plot.bin.freq.agephpower <- ggplot(
+    data=GAMext_freq_AGEPHPOWER, aes(ageph,power)) + 
+    geom_raster(aes(fill=s)) + 
+    theme_bw() +
+    scale_fill_gradient(expression(hat(f)[4](ageph,power)),low="#99CCFF",high="#003366") +
+    stat_contour(aes(z=s),breaks=seq(-0.7,0.7,0.05),lty=2,colour="white") + 
+    stat_contour(aes(z=s),breaks=0,lty=1,colour="white") +
+    geom_segment(aes(x=xmin,y=ymin,xend=xmin,yend=ymax),data=splits_freq_AGEPHPOWER) +
+    geom_segment(aes(x=xmin,y=ymin,xend=xmax,yend=ymin),data=splits_freq_AGEPHPOWER) +
+    geom_segment(aes(x=xmin,y=ymax,xend=xmax,yend=ymax),data=splits_freq_AGEPHPOWER) +
+    geom_segment(aes(x=xmax,y=ymin,xend=xmax,yend=ymax),data=splits_freq_AGEPHPOWER)
+
+
+plot.bin.freq.agephpower
+```
+
+```{r}
+
+sm <- gratia::smooth_estimates(freq_gam_geo)
+
+ggplot(data=sm) +
+    geom_raster(
+        aes(x=ageph, y=power, fill=.estimate)) +
+  #  geom_contour_filled(
+  #      data=sm,
+  #      aes(x=ageph, y=power, z=.estimate),
+  #      bins = 30,
+  #      col = "white",
+  #      lty = 2
+  #  ) +
+    scale_fill_gradient(low="#99CCFF",high="#003366") +
+    theme_bw() +
+    stat_contour(aes(x=ageph, y=power, z=.estimate),breaks=0,lty=1,colour="white") +
+    stat_contour(aes(x=ageph, y=power, z=.estimate),lty=2,colour="white", bins=50) + 
+    geom_segment(aes(x=xmin,y=ymin,xend=xmin,yend=ymax), data=splits_freq_AGEPHPOWER, lwd=1) +
+    geom_segment(aes(x=xmin,y=ymin,xend=xmax,yend=ymin), data=splits_freq_AGEPHPOWER, lwd=1) +
+    geom_segment(aes(x=xmin,y=ymax,xend=xmax,yend=ymax), data=splits_freq_AGEPHPOWER, lwd=1) +
+    geom_segment(aes(x=xmax,y=ymin,xend=xmax,yend=ymax), data=splits_freq_AGEPHPOWER, lwd=1)
+
+```
+
+# GAM to GLM
+
+Use the categorical risk factors generated above to fit the requisite GLM (frequency, severity, loss cost). The risk factor with the largest exposure is the base class.
+
+```{r createcategoricaldata}
+
+# categorical or previously binned geo features
+mtpl_bin <- mtpl_geo[c("nclaims","expo","coverage","fuel","geo")]
+
+# bin continuous main effects
+mtpl_bin$ageph <- cut(
+    mtpl_geo$ageph, splits_freq_AGEPH, right = FALSE, include.lowest = TRUE
+)
+mtpl_bin$power <- cut(
+    mtpl_geo$power, splits_freq_POWER, right = FALSE, include.lowest = TRUE
+)
+mtpl_bin$bm <- cut(
+    mtpl_geo$bm, splits_freq_BM, right = FALSE, include.lowest = TRUE
+)
+
+# bin continuous interaction effects
+# interesting -- don't understand this well enough
+
+mtpl_bin$agephpower <- round(
+    predict(
+        evtree_freq_agephpower,
+        data.frame("ageph"=mtpl_geo$ageph, "power"=mtpl_geo$power),
+        type="response"
+        ), 4)
+mtpl_bin$agephpower[abs(mtpl_bin$agephpower) < 0.01] <- 0
+mtpl_bin$agephpower <- as.factor(mtpl_bin$agephpower)
+
+```
+
+```{r}
+table(mtpl_bin$coverage)
+table(mtpl_bin$fuel)
+table(mtpl_bin$geo)
+table(mtpl_bin$ageph)
+table(mtpl_bin$power)
+table(mtpl_bin$bm)
+table(mtpl_bin$agephpower)
+```
+
+```{r}
+
+# refactor this with forcats::
+mtpl_bin$coverage <- as.factor(mtpl_bin$coverage)
+mtpl_bin$coverage <- relevel(mtpl_bin$coverage, ref = "TPL")
+mtpl_bin$fuel <- as.factor(mtpl_bin$fuel)
+mtpl_bin$fuel <- relevel(mtpl_bin$fuel, ref = "gasoline")
+mtpl_bin$geo <- relevel(mtpl_bin$geo, ref = "[-0.036,0.11)")
+mtpl_bin$ageph <- relevel(mtpl_bin$ageph, ref = "[33,51)")
+mtpl_bin$power <- relevel(mtpl_bin$power, ref = "[46,75)")
+mtpl_bin$bm <- relevel(mtpl_bin$bm, ref = "[0,1)")
+mtpl_bin$agephpower <- relevel(mtpl_bin$agephpower, ref = "0")
+```
+
+### Frequency GLM
+
+```{r}
+
+freq_glm <- mgcv::gam(
+    nclaims ~ coverage + fuel + ageph + power + bm + geo + agephpower,
+    offset = log(expo),
+    data = mtpl_bin,
+    family = poisson(link = "log")
+)
+```
+
+```{r}
+
+summary(freq_glm)
+```
+
+```{r}
+
+anova(freq_glm)
+```
+
+The GLM coefficients are a re-scaled version of the actual coefficients, to make the GAM effects and the GLM coefficient comparable. For categorical risk factors in a traditional GLM model, the GLM coefficient for the reference class is equal to zero and the GLM coefficients of the other classes are expressed *relative to this reference class*.
+
+Adjust the GLM coefficients such that the weighted mean of the re-scaled GLM coefficients is equal to zero. This is done **only** to enable a visual comparison between the GAM effects and the GLM coefficients.
+
+$$
+\tilde{\beta}_{\text {riskfact }_j}=\hat{\beta}_{\mathrm{riskfact}_j}-\frac{\sum_{j=1}^{k_{\text {riskfact }}} m_{\text {riskfact }_j} \hat{\beta}_{\text {riskfact }_j}}{\sum_{j=1}^{k_{\text {riskfact }}} m_{\text {riskfact }_j}}
+$$
+
+-   $k_{\text{riskfact}}$: number of bins for the risk-factor
+
+-   $m_{\text {riskfact }_j}$: number of policyholders in bin $j$
+
+-   $\hat{\beta}_{\mathrm{riskfact}_j}$: fitted GLM coefficient for policyholders in bin $j$
+
+```{r}
+
+# Identify factor columns
+factor_columns <- sapply(mtpl_bin, is.factor)
+
+# Get value counts for all factor columns
+factor_counts <- lapply(mtpl_bin[, factor_columns], table)
+as.vector(factor_counts$ageph)
+```
+
+```{r}
+
+freq_glm_coefficients <- freq_glm$coefficients
+freq_coefficient_names <- sub("\\[.*$", "", names(freq_glm_coefficients))
+matching_indices <- which(freq_coefficient_names == "ageph")
+matching_coefficients <- freq_glm_coefficients[matching_indices]
+
+data.frame("exposure" = as.vector(factor_counts$ageph),
+           "beta_hat" = c(0, as.vector(matching_coefficients))) %>%
+    mutate(tot_exp = sum(exposure),
+           bin_exp = beta_hat * exposure,
+           sum_bin_exp = sum(bin_exp),
+           weight_mean_coeff = sum_bin_exp/tot_exp,
+           beta_tilde = beta_hat - weight_mean_coeff,
+           labels = names(table(mtpl_bin$ageph))) %>%
+    select(labels, beta_tilde)
+
+```
+
+```{r}
+
+p_ageph <- gratia_plot_single(freq_gam, "s(ageph)", ageph)
+p_ageph <- p_ageph + geom_vline(xintercept = splits_freq_AGEPH[2:(length(splits_freq_AGEPH)-1)])
+callouts <- splits_freq_AGEPH[2:(length(splits_freq_AGEPH)-1)]
+# something here to find middle of y axis to use for y
+for (i in 1:length(callouts)) {
+  p_ageph <- p_ageph + annotate("text", x = callouts[i], y = 0.4, label = callouts[i], vjust = -0.5, angle = 90, size = 3, color = "blue")
+}
+
+new_points <- data.frame(x = seq(18, 25, 1), 
+                         y = rep(0.31763841, length(seq(18, 25, 1))))
+p_ageph <- p_ageph + geom_point(data = new_points, aes(x = x, y = y), color = "blue", size = 1)
+new_points <- data.frame(x = seq(26, 28, 1), 
+                         y = rep(0.18303222, length(seq(26, 28, 1))))
+p_ageph <- p_ageph + geom_point(data = new_points, aes(x = x, y = y), color = "blue", size = 1)
+new_points <- data.frame(x = seq(29, 32, 1), 
+                         y = rep(0.10394729, length(seq(29, 32, 1))))
+p_ageph <- p_ageph + geom_point(data = new_points, aes(x = x, y = y), color = "blue", size = 1)
+new_points <- data.frame(x = seq(33, 50, 1), 
+                         y = rep(0.03959007, length(seq(33, 50, 1))))
+p_ageph <- p_ageph + geom_point(data = new_points, aes(x = x, y = y), color = "blue", size = 1)
+new_points <- data.frame(x = seq(51, 55, 1), 
+                         y = rep(-0.02115620, length(seq(51, 55, 1))))
+p_ageph <- p_ageph + geom_point(data = new_points, aes(x = x, y = y), color = "blue", size = 1)
+new_points <- data.frame(x = seq(56, 60, 1), 
+                         y = rep(-0.12297637, length(seq(56, 60, 1))))
+p_ageph <- p_ageph + geom_point(data = new_points, aes(x = x, y = y), color = "blue", size = 1)
+new_points <- data.frame(x = seq(61, 72, 1), 
+                         y = rep(-0.20724769, length(seq(61, 72, 1))))
+p_ageph <- p_ageph + geom_point(data = new_points, aes(x = x, y = y), color = "blue", size = 1)
+new_points <- data.frame(x = seq(73, 95, 1), 
+                         y = rep(-0.15050776	, length(seq(73, 95, 1))))
+p_ageph <- p_ageph + geom_point(data = new_points, aes(x = x, y = y), color = "blue", size = 1)
+
+p_ageph
+```
+
+```{r}
+
+splits_freq_AGEPHPOWER
+```
+
+```{r}
+
+# How do we know which rectangle is at what level from the 
+library(RColorBrewer)
+
+# Define the palette
+palette <- brewer.pal(5, "Blues")
+
+rects <- data.frame(
+  xmin = c(0, 0, 0, 40, 57, 57, 57),
+  xmax = c(40, 40, 40, 57, max(mtpl$ageph), max(mtpl$ageph), max(mtpl$ageph)),
+  ymin = c(0, 49, 72, 0, 0, 47, 68),
+  ymax = c(49, 72, max(mtpl$power), max(mtpl$power), 47, 68, max(mtpl$power)),
+  fill = factor(c(2, 3, 4, 3, 5, 3, 1))
+)
+palette <- brewer.pal(5, "Blues")
+custom_labels <- c("1" = "-0.071", "2" = "-0.026", "3" = "0", "4" = "0.035", "5" = "0.058")
+# Create the plot
+interact_bins <- ggplot() +
+  geom_rect(data = rects, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill)) +
+  scale_fill_manual(values = palette,labels = custom_labels, name = "GLM Coefficients") +
+  theme_bw() +
+  labs(x = "ageph", y = "power", fill = "Section") 
+
+```
+
+```{r}
+
+sm <- gratia::smooth_estimates(freq_gam_geo)
+
+interact_continuous <- ggplot(data=sm) +
+    geom_raster(
+        aes(x=ageph, y=power, fill=.estimate)) +
+    scale_fill_gradient(low="#99CCFF", high="#003366", name = "GAM Effect") +
+    theme_bw() +
+    stat_contour(aes(x=ageph, y=power, z=.estimate),breaks=0,lty=1,colour="white") +
+    stat_contour(aes(x=ageph, y=power, z=.estimate),lty=2,colour="white", bins=50)
+```
+
+```{r}
+
+#| label: fig-gamvglminteract
+#| fig-cap: "Comparison between GAM effect and GLM coefficients for interaction between ageph and power"
+#| fig-height: 4
+#| fig-width: 10
+
+grid.arrange(interact_continuous, interact_bins, ncol=2)
+```

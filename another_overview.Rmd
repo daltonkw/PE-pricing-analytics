@@ -1,0 +1,168 @@
+---
+title: "Review of Data Driven Binning Strategy for Insurance Tariff Classes"
+format: html
+editor: visual
+---
+
+# Overview
+
+*A data driven strategy to bin continuous and spatial risk factors in order to obtain categorical risk factors with a limited number of levels.*
+
+"Generalized additive models (GAMs) extend the framework of GLMs and allow for smooth continuous effects in the predictor structure. This results in a statistically more flexible model compared to the GLM. In practice however, actuaries tend to prefer the simplicity of GLMs with categorical risk factors over GAMs with smooth effects, because pricing models should be interpretable, intuitive, explainable to clients and regulators, easy to program and adjustable to marketing needs and benchmark studies with competitors."
+
+Authors frame this paper between two existing approaches (? according to who) of handling different types of risk factors (features) (categorical, continuous, spatial) in insurance pricing literature:
+
+1.  Predefined bins for the continuous and spatial features. A disadvantage of which is that the response variable isn't taken into account in the binning process.
+2.  Develop GAMs for pricing with flexible effects of continuous and spatial risk factors. Presumably these don't align well with the production requirements of an insurance company?
+
+<https://katrienantonio.github.io/publication/>
+
+<https://katrienantonio.github.io/publication/2018-data-driven/>
+
+<https://katrienantonio.github.io/publication/2021-boosting/>
+
+## tl;dr
+
+-   *"... a general framework that aligns the statistical advantages of flexible modeling with GAMs to the requirements of a production environment in an insurance company."*
+
+-   Illustrates a basic strategy to construct tariff classes in GLMs in a data driven way.
+
+-   Bin *continuous* and *spatial* risk factors based on their GAM effects, resulting in categorical risk factors which are easily deployed in a GLM.
+
+-   Start from GAMs with smooth effects and transform these models into GLMs with categorical effects that satisfy the practical needs of the company to present and explain to internal and external stakeholders.
+
+-   Perform an exhaustive search for the optimal GAM model without taking account interactions between the risk factors.
+
+-   In the next step perform an additional exhaustive search for meaningful interactions which improve the model fit, only exploring interactions between continuous risk factors which have been selected in the first step.
+
+EXPAND THIS BY USING PURE PREMIUM
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(magrittr)
+library(ggplot2)
+library(gridExtra)
+
+# colors for the paper
+KULbg <- "#116E8A"
+```
+
+```{r data-import, echo=FALSE}
+
+mtpl_orig <- read.table('./scripts/data/P&Cdata.txt', header = TRUE)
+mtpl_orig <- dplyr::as_tibble(mtpl_orig)
+
+mtpl <- mtpl_orig %>%
+    dplyr::rename_all(function(.name) {
+        .name %>% tolower}
+        )
+mtpl <- dplyr::rename(mtpl, expo = exp)
+```
+
+# The Data
+
+Belgian motor data. *At policyholder level*. Typical motor claim & loss distribution.
+
+| **Variable** | **Description**                                                                                                                  |
+|------------------|------------------------------------------------------|
+| nclaims      | The number of claims filed by the policyholder.                                                                                  |
+| exp          | The fraction of the year 1997 during which the policyholder was exposed to the risk.                                             |
+| amount       | The total amount claimed by the policyholder in Euros.                                                                           |
+| coverage     | Type of coverage provided by the insurance policy: TPL, PO or FO.                                                                |
+|              | TPL = only third party liability, BI/PD                                                                                          |
+|              | PO = partial omnium = TPL + limited material damage, BI/PD + Coll                                                                |
+|              | FO = full omnium = TPL + comprehensive material damage. BI/PD + Coll + Comp                                                      |
+| fuel         | Type of fuel of the vehicle: gasoline or diesel.                                                                                 |
+| sex          | Gender of the policyholder: male or female.                                                                                      |
+| use          | Main use of the vehicle: private or work.                                                                                        |
+| fleet        | The vehicle is part of a fleet: yes or no.                                                                                       |
+| ageph        | Age of the policyholder in years.                                                                                                |
+| power        | Horsepower of the vehicle in kilowatt.                                                                                           |
+| agec         | Age of the vehicle in years.                                                                                                     |
+| bm           | Level occupied in the former compulsory Belgian bonus–malus scale. From 0 to 22, a higher level indicates a worse claim history. |
+| long         | Longitude coordinate of the center of the municipality where the policyholder resides.                                           |
+| lat          | Latitude coordinate of the center of the municipality where the policyholder resides.                                            |
+
+```{r basic_data_table}
+
+mtpl %>%
+    dplyr::slice(1:5) %>%
+    dplyr::select(-id, -long, -lat) %>%
+    gt::gt() %>%
+        gt::tab_header(
+            title = gt::md("**Belgian Motor Data**")
+        ) %>%
+        gt::fmt_number(
+            columns = c(amount, avg, expo), 
+            decimals = 2,
+        )
+```
+
+```{r plot_wrappers}
+
+col <- KULbg
+fill <- KULbg
+ylab <- "Relative frequency"
+
+# wrapper functions
+ggplot.bar <- function(DT, variable, xlab){
+  ggplot(data = DT, aes(as.factor(variable))) + theme_bw() + 
+    geom_bar(aes(y = (after_stat(count))/sum(after_stat(count))), col = col, fill = fill, alpha = 0.5) + labs(x = xlab, y = ylab)
+}
+
+ggplot.hist <- function(DT, variable, xlab, binwidth){
+  ggplot(data = DT, aes(variable)) + theme_bw() + 
+    geom_histogram(aes(y = (after_stat(count))/sum(after_stat(count))), binwidth = binwidth, col = col, fill = fill, alpha = 0.5) + 
+    labs(x = xlab, y = ylab)
+}
+```
+
+```{r figs01, warning=FALSE}
+
+#| label: fig-plot
+#| fig-cap: "Plot"
+
+# capping severity for whatever reason
+mtpl.sev <- mtpl %>% 
+    dplyr::filter(amount > 0 & avg <= 81000)
+
+plot.eda.nclaims <- ggplot.bar(mtpl, variable = mtpl$nclaims, "nclaims")
+plot.eda.exp <- ggplot.hist(mtpl, mtpl$expo, "expo", 0.05)
+plot.eda.amount <- ggplot(data = mtpl.sev, aes(avg)) + geom_density(adjust = 3, col = col, fill = fill, alpha = 0.5) + xlim(0, 1e4) + ylab(ylab) + xlab("severity") + theme_bw()
+
+grid.arrange(plot.eda.nclaims, plot.eda.exp, plot.eda.amount, ncol=3)
+```
+
+```{r figs02, warning=FALSE, fig.height=8, fig.cap="\\label{fig::figs02}relative frequency of covariates"}
+
+# Bar plots of factor variables
+plot.eda.coverage <- ggplot.bar(mtpl, mtpl$coverage, "coverage")
+plot.eda.fuel <- ggplot.bar(mtpl, mtpl$fuel, "fuel")
+plot.eda.sex <- ggplot.bar(mtpl, mtpl$sex, "sex")
+plot.eda.use <- ggplot.bar(mtpl, mtpl$use, "use")
+plot.eda.fleet <- ggplot.bar(mtpl, mtpl$fleet, "fleet")
+
+# Histograms of continuous variables
+plot.eda.ageph <- ggplot.hist(mtpl, mtpl$ageph, "policyholder age", 2)
+plot.eda.agec <- ggplot.hist(mtpl, mtpl$agec, "vehicle age", 1)
+plot.eda.bm <- ggplot.hist(mtpl, mtpl$bm, "bonus-malus", 2)
+plot.eda.power <- ggplot.hist(mtpl, mtpl$power, "vehicle power", 10)
+
+grid.arrange(
+    plot.eda.coverage,
+    plot.eda.fuel,
+    plot.eda.sex,
+    plot.eda.use,
+    plot.eda.fleet,
+    plot.eda.ageph,
+    plot.eda.power,
+    plot.eda.agec,
+    plot.eda.bm, ncol = 3)
+```
+
+```{r}
+
+#| label: myFirstFigure
+#| fig-cap: A caption
+plot(1:10)
+```
